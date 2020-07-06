@@ -17,3 +17,8 @@ import_test/
 *.log
 deploy/
 export/
+.classpath
+.project
+.settings
+.vscode
+bin/
