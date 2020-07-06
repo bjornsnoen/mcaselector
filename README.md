@@ -197,6 +197,7 @@ Headless mode can be run in different modes:
 | Export chunks | `--mode export` | Export chunks based on a filter query and/or a selection. |
 | Import chunks | `--mode import` | Import chunks with an optional offset. |
 | Delete chunks | `--mode delete` | Delete chunks based on a filter query and/or a selection. |
+| Delete entities | `--mode deleteBlock` | Delete all entities/tile entities/ticking tiles with the given entity id in the selected chunks |
 | Change NBT | `--mode change` | Changes NBT values in an entire world or only in chunks based on a selection. |
 | Cache images | `--mode cache` | Generates the cache images for an entire world. |
 

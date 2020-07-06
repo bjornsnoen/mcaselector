@@ -16,19 +16,33 @@ import net.querz.mcaselector.io.CacheHelper;
 import net.querz.mcaselector.property.DataProperty;
 import net.querz.mcaselector.debug.Debug;
 import net.querz.mcaselector.io.FileHelper;
+import net.querz.mcaselector.io.MCAChunkData;
+import net.querz.mcaselector.io.MCAFile;
 import net.querz.mcaselector.point.Point2i;
 import net.querz.mcaselector.range.Range;
 import net.querz.mcaselector.range.RangeParser;
+import net.querz.nbt.tag.CompoundTag;
+import net.querz.nbt.tag.ListTag;
+import net.querz.nbt.tag.StringTag;
+
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
+
+import javafx.util.Pair;
 
 public class ParamExecutor {
 
@@ -51,13 +65,14 @@ public class ParamExecutor {
 			// register parameter dependencies and restrictions
 			pi.registerDependencies("headless", null, new ActionKey("mode", null));
 			pi.registerDependencies("mode", null, new ActionKey("headless", null));
-			pi.registerRestrictions("mode", "select", "export", "import", "delete", "change", "cache");
+			pi.registerRestrictions("mode", "select", "export", "import", "delete", "change", "cache", "deleteBlock");
 			pi.registerDependencies("mode", null, new ActionKey("world", null)); // every mode param needs a world dir
 			pi.registerDependencies("mode", "select", new ActionKey("output", null), new ActionKey("query", null));
 			pi.registerDependencies("mode", "export", new ActionKey("output", null));
 			pi.registerDependencies("mode", "import", new ActionKey("input", null));
 			pi.registerDependencies("mode", "change", new ActionKey("query", null));
 			pi.registerDependencies("mode", "cache", new ActionKey("output", null));
+			pi.registerDependencies("mode", "deleteBlock", new ActionKey("csv", null), new ActionKey("block-id", null));
 			pi.registerDependencies("world", null, new ActionKey("mode", null)); // world param needs mode param
 			pi.registerSoftDependencies("output", null, new ActionKey("mode", "select"), new ActionKey("mode", "export"), new ActionKey("mode", "cache"));
 			pi.registerSoftDependencies("input", null, new ActionKey("mode", "export"), new ActionKey("mode", "import"), new ActionKey("mode", "delete"), new ActionKey("mode", "change"));
@@ -89,6 +104,7 @@ public class ParamExecutor {
 			pi.registerAction("mode", "delete", v -> runModeDelete(params.get(), future));
 			pi.registerAction("mode", "change", v -> runModeChange(params.get(), future));
 			pi.registerAction("mode", "cache", v -> runModeCache(params.get(), future));
+			pi.registerAction("mode", "deleteBlock", v -> deleteBlocksByIdInRegions(params.get(), future));
 
 			pi.execute();
 
@@ -304,6 +320,119 @@ public class ParamExecutor {
 		});
 
 		ChunkFilterSelector.selectFilter(g, radius, selection::putAll, progress, true);
+	}
+
+	private static void deleteBlocksByIdInRegions(Map<String, String> params, FutureTask<Boolean> future) throws IOException
+	{
+		File world = parseDirectory(params.get("world"));
+		checkDirectoryForFiles(world, FileHelper.MCA_FILE_PATTERN);
+		Config.setWorldDir(world);
+
+		printHeadlessSettings();
+
+		File csv = new File(params.get("csv"));
+		Map<Point2i, Set<Point2i>> locations = SelectionHelper.importSelection(csv);
+		if (locations.size() == 0) {
+			System.out.println("Provided csv file is empty");
+			future.run();
+			return;
+		}
+		String blockId = params.get("block-id");
+		List<String> whatWeAreLookingFor;
+		if (blockId.indexOf(":") != -1){
+			whatWeAreLookingFor = Arrays.asList(blockId, blockId.split(":")[1]);
+		} else {
+			whatWeAreLookingFor = Arrays.asList(blockId);
+		}
+
+		ConsoleProgress progressBar = new ConsoleProgress();
+		progressBar.setMax(locations.size());
+		progressBar.onDone(() -> {future.run();});
+		int progress = 0;	
+		File regionFile = FileHelper.createMCAFilePath(locations.entrySet().iterator().next().getKey());
+		progressBar.updateProgress(regionFile.getName(), progress);
+
+		for (Map.Entry<Point2i, Set<Point2i>> entry : locations.entrySet()) {
+			Point2i region = entry.getKey();
+			Set<Point2i> chunkCoordinates = entry.getValue();
+			
+			MCAFile file = MCAFile.read(FileHelper.createMCAFilePath(region));
+			if (progress > 0) {
+				progressBar.updateProgress(file.getFile().getName(), progress);
+			}
+			
+			for (Point2i chunkCoordinate : chunkCoordinates) {
+				MCAChunkData chunkData = file.getLoadedChunkData(chunkCoordinate);
+				CompoundTag data = chunkData.getData();
+				CompoundTag level = data.getCompoundTag("Level");
+
+				ArrayList<Pair<String, CompoundTag>> allEntities = new ArrayList<>();
+				ArrayList<Pair<String, Integer>> toRemove = new ArrayList<>();
+				Map<String, ListTag<CompoundTag>> mapOfLists = new HashMap<>();
+
+				@SuppressWarnings("unchecked")
+				ListTag<CompoundTag> entities = (ListTag<CompoundTag>)level.getListTag("Entities");
+				mapOfLists.put("Entities", entities);
+				@SuppressWarnings("unchecked")
+				ListTag<CompoundTag> tileTicks = (ListTag<CompoundTag>)level.getListTag("TileTicks");
+				mapOfLists.put("TileTicks", tileTicks);
+				@SuppressWarnings("unchecked")
+				ListTag<CompoundTag> tileEntities = (ListTag<CompoundTag>)level.getListTag("TileEntities");
+				mapOfLists.put("TileEntities", tileEntities);
+
+				for (Map.Entry<String, ListTag<CompoundTag>> node: mapOfLists.entrySet()) {
+					if (Objects.nonNull(node.getValue())) {
+						for (CompoundTag entity : node.getValue()) {
+							allEntities.add(new Pair<String, CompoundTag>(node.getKey(), entity));
+						}
+					}
+				}
+
+				for (Pair<String, CompoundTag> tag : allEntities) {
+					StringTag idTag;
+					if (tag.getKey() == "TileTicks") {
+						idTag = tag.getValue().getStringTag("i");
+					} else {
+						idTag = tag.getValue().getStringTag("id");
+					}
+					if (whatWeAreLookingFor.contains(idTag.getValue())) {
+						for (int i = 0; i < mapOfLists.get(tag.getKey()).size(); i++) {
+							if (mapOfLists.get(tag.getKey()).get(i) == tag.getValue()) {
+								toRemove.add(new Pair<String, Integer>(tag.getKey(), i));
+							}
+						}
+					} else if ((idTag.getValue().equals("minecraft:item")) || (idTag.getValue().equals("minecraft:item_frame"))) {
+						CompoundTag item = tag.getValue().getCompoundTag("Item");
+						if (whatWeAreLookingFor.contains(item.getStringTag("id").getValue())) {
+							for (int i = 0; i < mapOfLists.get(tag.getKey()).size(); i++) {
+								if (mapOfLists.get(tag.getKey()).get(i) == tag.getValue()) {
+									toRemove.add(new Pair<String, Integer>(tag.getKey(), i));
+								}
+							}
+						}
+					}
+				}
+
+				Map<String, Integer> removedByList = new HashMap<>();
+				removedByList.put("Entities", 0);
+				removedByList.put("TileEntities", 0);
+				removedByList.put("TileTicks", 0);
+				for (Pair<String, Integer> item: toRemove) {
+					mapOfLists.get(item.getKey()).remove(item.getValue() - removedByList.get(item.getKey()));
+					removedByList.put(item.getKey(), removedByList.get(item.getKey()) + 1);
+				}
+			}
+
+			File tmpFile = File.createTempFile(file.getFile().getName(), null, null);
+			RandomAccessFile raf = new RandomAccessFile(tmpFile, "rw");
+			try {
+				file.saveAll(raf);
+				Files.move(tmpFile.toPath(), file.getFile().toPath(), StandardCopyOption.REPLACE_EXISTING);
+				progress++;
+			} catch (Exception exception){}
+		}
+
+		progressBar.updateProgress("Done", progress);
 	}
 
 	private static void printHeadlessSettings() {
